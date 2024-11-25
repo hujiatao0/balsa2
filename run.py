@@ -8,6 +8,7 @@ import pickle
 import balsa
 import numpy as np
 import experiments
+import pprint
 
 from balsa.util import plans_lib
 import train_utils
@@ -17,12 +18,177 @@ import signal
 import sim as sim_lib
 from balsa import costing
 from balsa.experience import Experience
+from balsa.util import postgres
+import pg_executor
 
 
 FLAGS = flags.FLAGS
 flags.DEFINE_string('run', 'Balsa_JOBRandSplit', 'Experiment config to run.')
 flags.DEFINE_boolean('local', False,
                      'Whether to use local engine for query execution.')
+
+def Save(obj, path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'wb') as f:
+        pickle.dump(obj, f)
+    return path
+
+
+@ray.remote
+def ExecuteSql(query_name,
+               sql_str,
+               hint_str,
+               hinted_plan,
+               query_node,
+               predicted_latency,
+               curr_timeout_ms=None,
+               found_plans=None,
+               predicted_costs=None,
+               silent=False,
+               is_test=False,
+               use_local_execution=True,
+               plan_physical=True,
+               repeat=1,
+               engine='postgres'):
+    """Executes a query.
+
+    Returns:
+      If use_local_execution:
+        A (pg_executor, dbmsx_executor).Result.
+      Else:
+        A ray.ObjectRef of the above.
+    """
+    # Unused args.
+    del query_name, hinted_plan, query_node, predicted_latency, found_plans,\
+        predicted_costs, silent, is_test, plan_physical
+
+    assert engine in ('postgres', 'dbmsx'), engine
+    if engine == 'postgres':
+        return postgres.ExplainAnalyzeSql(sql_str,
+                                          comment=hint_str,
+                                          verbose=False,
+                                          geqo_off=True,
+                                          timeout_ms=curr_timeout_ms,
+                                          remote=not use_local_execution)
+    
+
+def HintStr(node, with_physical_hints, engine):
+    if engine == 'postgres':
+        return node.hint_str(with_physical_hints=with_physical_hints)
+
+
+def ParseExecutionResult(result_tup,
+                         query_name,
+                         sql_str,
+                         hint_str,
+                         hinted_plan,
+                         query_node,
+                         predicted_latency,
+                         curr_timeout_ms=None,
+                         found_plans=None,
+                         predicted_costs=None,
+                         silent=False,
+                         is_test=False,
+                         use_local_execution=True,
+                         plan_physical=True,
+                         repeat=None,
+                         engine='postgres'):
+    del repeat  # Unused.
+    messages = []
+    result = result_tup.result
+    has_timeout = result_tup.has_timeout
+    server_ip = result_tup.server_ip
+    if has_timeout:
+        assert not result, result
+    if engine == 'dbmsx':
+        real_cost = -1 if has_timeout else result_tup.latency
+    else:
+        if has_timeout:
+            real_cost = -1
+        else:
+            json_dict = result[0][0][0]
+            real_cost = json_dict['Execution Time']
+    if hint_str is not None:
+        # Check that the hint has been respected.  No need to check if running
+        # baseline.
+        do_hint_check = True
+        if engine == 'dbmsx':
+            raise NotImplementedError
+        else:
+            if not has_timeout:
+                executed_node = postgres.ParsePostgresPlanJson(json_dict)
+            else:
+                # Timeout has occurred & 'result' is empty.  Fallback to
+                # checking against local Postgres.
+                print('Timeout occurred; checking the hint against local PG.')
+                executed_node, _ = postgres.SqlToPlanNode(sql_str,
+                                                          comment=hint_str,
+                                                          verbose=False)
+            executed_node = plans_lib.FilterScansOrJoins(executed_node)
+            executed_hint_str = executed_node.hint_str(
+                with_physical_hints=plan_physical)
+        if do_hint_check and hint_str != executed_hint_str:
+            print('initial\n', hint_str)
+            print('after\n', executed_hint_str)
+            msg = 'Hint not respected for {}; server_ip={}'.format(
+                query_name, server_ip)
+            try:
+                assert False, msg
+            except Exception as e:
+                print(e, flush=True)
+                import ipdb
+                ipdb.set_trace()
+
+    if not silent:
+        messages.append('{}Running {}: hinted plan\n{}'.format(
+            '[Test set] ' if is_test else '', query_name, hinted_plan))
+        messages.append('filters')
+        messages.append(pprint.pformat(query_node.info['all_filters']))
+        messages.append('')
+        messages.append('q{},{:.1f},{}'.format(query_node.info['query_name'],
+                                               real_cost, hint_str))
+        messages.append(
+            '{} Execution time: {:.1f} (predicted {:.1f}) curr_timeout_ms={}'.
+            format(query_name, real_cost, predicted_latency, curr_timeout_ms))
+
+    if hint_str is None or silent:
+        # Running baseline: don't print debug messages below.
+        return result_tup, real_cost, server_ip, '\n'.join(messages)
+
+    messages.append('Expert plan: latency, predicted, hint')
+    expert_hint_str = query_node.hint_str()
+    expert_hint_str_physical = query_node.hint_str(with_physical_hints=True)
+    messages.append('  {:.1f} (predicted {:.1f})  {}'.format(
+        query_node.cost, query_node.info['curr_predicted_latency'],
+        expert_hint_str))
+    if found_plans:
+        if predicted_costs is None:
+            predicted_costs = [None] * len(found_plans)
+        messages.append('SIM-predicted costs, predicted latency, plan: ')
+        min_p_latency = np.min([p_latency for p_latency, _ in found_plans])
+        for p_cost, found in zip(predicted_costs, found_plans):
+            p_latency, found_plan = found
+            found_hint_str = found_plan.hint_str()
+            found_hint_str_physical = HintStr(found_plan,
+                                              with_physical_hints=True,
+                                              engine=engine)
+            extras = [
+                'cheapest' if p_latency == min_p_latency else '',
+                '[expert plan]'
+                if found_hint_str_physical == expert_hint_str_physical else '',
+                '[picked]' if found_hint_str_physical == hint_str else ''
+            ]
+            extras = ' '.join(filter(lambda s: s, extras)).strip()
+            if extras:
+                extras = '<-- {}'.format(extras)
+            if p_cost:
+                messages.append('  {:.1f}  {:.1f}  {}  {}'.format(
+                    p_cost, p_latency, found_hint_str, extras))
+            else:
+                messages.append('          {:.1f}  {}  {}'.format(
+                    p_latency, found_hint_str, extras))
+    messages.append('-' * 80)
+    return result_tup, real_cost, server_ip, '\n'.join(messages)
 
 
 class BalsaAgent(object):
@@ -230,9 +396,113 @@ class BalsaAgent(object):
         if self.sim is None:
             self.sim = TrainSim(p, self.loggers)
         return self.sim
+    
+    def RunBaseline(self):
+        p = self.params
+        print('Dropping buffer cache.')
+        postgres.DropBufferCache()
+        print('Running queries as-is (baseline PG performance)...')
+
+        def Args(node):
+            return {
+                'query_name': node.info['query_name'],
+                'sql_str': node.info['sql_str'],
+                'hint_str': None,
+                'hinted_plan': None,
+                'query_node': node,
+                'predicted_latency': 0,
+                'silent': True,
+                'use_local_execution': p.use_local_execution,
+                'engine': p.engine,
+            }
+
+        tasks = []
+        for node in self.all_nodes:
+            # Run the query.
+            tasks.append(
+                ExecuteSql.options(resources={
+                    f'node:{ray.util.get_node_ip_address()}': 1,
+                }).remote(**Args(node)))
+        if not p.use_local_execution:
+            refs = ray.get(tasks)
+        else:
+            refs = tasks
+        for i, node in enumerate(self.all_nodes):
+            result_tup = ray.get(refs[i])
+            assert isinstance(
+                result_tup,
+                pg_executor.Result), result_tup
+            result, real_cost, _, message = ParseExecutionResult(
+                result_tup, **Args(node))
+            # Save real cost (execution latency) to actual.
+            node.cost = real_cost
+            print('---------------------------------------')
+            if p.engine == 'postgres':
+                node.info['explain_json'] = result[0][0][0]
+                # 'node' is a PG plan; doesn't make sense to print if executed
+                # on a different engine.
+                print(node)
+            print(message)
+            print('q{},{:.1f} (baseline)'.format(node.info['query_name'],
+                                                 real_cost))
+            print('Execution time: {}'.format(real_cost))
+        # NOTE: if engine != pg, we're still saving PG plans but with target
+        # engine's latencies.  This mainly affects debug strings.
+        Save(self.workload, './data/initial_policy_data.pkl')
+        self.LogExpertExperience(self.train_nodes, self.test_nodes)
       
     def Run(self):
-        pass
+        p = self.params
+        if p.run_baseline:
+            return self.RunBaseline()
+        else:
+            self.curr_value_iter = 0
+            self.num_query_execs = 0
+            self.num_total_timeouts = 0
+            self.overall_best_train_latency = np.inf
+            self.overall_best_test_latency = np.inf
+            self.overall_best_test_swa_latency = np.inf
+            self.overall_best_test_ema_latency = np.inf
+            # For reporting cleaner hint strings for expert plans, remove their
+            # unary ops (e.g., Aggregates).  These calls return copies, so
+            # self.{all,train,test}_nodes no longer share any references.
+            self.train_nodes = plans_lib.FilterScansOrJoins(self.train_nodes)
+            self.test_nodes = plans_lib.FilterScansOrJoins(self.test_nodes)
+
+        while self.curr_value_iter < p.val_iters:
+            has_timeouts = self.RunOneIter()
+            self.LogTimings()
+
+            if (p.early_stop_on_skip_fraction is not None and
+                    self.curr_iter_skipped_queries >=
+                    p.early_stop_on_skip_fraction * len(self.train_nodes)):
+                break
+
+            if p.drop_cache and p.use_local_execution:
+                print('Dropping buffer cache.')
+                postgres.DropBufferCache()
+
+            if p.increment_iter_despite_timeouts:
+                # Always increment the iteration counter.  This makes it fairer
+                # to compare runs with & without the timeout mechanism (or even
+                # between timeout runs).
+                self.curr_value_iter += 1
+                self.lr_schedule.Step()
+                if self.adaptive_lr_schedule is not None:
+                    self.adaptive_lr_schedule.Step()
+            else:
+                if has_timeouts:
+                    # Don't count this value iter.
+                    # NOTE: it is possible for runs with use_timeout=False to
+                    # have timeout events.  This can happen due to pg_executor
+                    # encountering an out-of-memory / internal error and
+                    # treating an execution as a timeout.
+                    pass
+                else:
+                    self.curr_value_iter += 1
+                    self.lr_schedule.Step()
+                    if self.adaptive_lr_schedule is not None:
+                        self.adaptive_lr_schedule.Step()
 
 
 def _GetQueryFeaturizerClass(p):

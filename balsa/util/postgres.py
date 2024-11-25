@@ -2,6 +2,44 @@ import pg_executor
 import re
 from balsa.util import plans_lib
 import pprint
+import subprocess
+
+
+
+def DropBufferCache():
+    # WARNING: no effect if PG is running on another machine
+    subprocess.check_output(['free', '&&', 'sync'])
+    # subprocess.check_output(
+    #     ['sh', '-c', 'echo 3 > /proc/sys/vm/drop_caches'])
+    subprocess.check_output(['free'])
+
+    with pg_executor.Cursor() as cursor:
+        cursor.execute('DISCARD ALL;')
+
+
+def ExplainAnalyzeSql(sql,
+                      comment=None,
+                      verbose=False,
+                      geqo_off=False,
+                      timeout_ms=None,
+                      is_test=False,
+                      remote=False):
+    """Runs EXPLAIN ANALYZE.
+
+    Returns:
+      If remote:
+        A pg_executor.Result.
+      Else:
+        A ray.ObjectRef of the above.
+    """
+    return _run_explain('explain (verbose, analyze, format json)',
+                        sql,
+                        comment,
+                        verbose,
+                        geqo_off,
+                        timeout_ms,
+                        is_test=is_test,
+                        remote=remote)
 
 
 def SqlToPlanNode(sql,

@@ -58,6 +58,16 @@ class BalsaParams(object):
                   ' performance is evaluated.'
             )
         
+        # Offline replay.
+        p.Define(
+            'prev_replay_buffers_glob', None,
+            'If specified, load previous replay buffers and merge them as training purpose.'
+        )
+        p.Define(
+            'prev_replay_buffers_glob_val', None,
+            'If specified, load previous replay buffers and merge them as validation purpose.'
+        )
+        
         # Modeling: tree convolution (suggested).
         p.Define('tree_conv', True,
                  'If true, use tree convolutional neural net.')

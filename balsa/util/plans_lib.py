@@ -41,6 +41,27 @@ class Node(object):
             return self.table_name + ' AS ' + self.table_alias
         assert self.table_name is not None
         return self.table_name
+    
+    @functools.lru_cache(maxsize=128)
+    def to_str(self, with_cost=True, indent=0):
+        s = '' if indent == 0 else ' ' * indent
+        if self.table_name is None:
+            if with_cost:
+                s += '{} cost={}\n'.format(self.node_type, self.cost)
+            else:
+                s += '{}\n'.format(self.node_type)
+        else:
+            if with_cost:
+                s += '{} [{}] cost={}\n'.format(self.node_type,
+                                                self.get_table_id(), self.cost)
+            else:
+                s += '{} [{}]\n'.format(
+                    self.node_type,
+                    self.get_table_id(),
+                )
+        for c in self.children:
+            s += c.to_str(with_cost=with_cost, indent=indent + 2)
+        return s
 
     def GetOrParseSql(self):
         """Parses the join graph of this node into (nx.Graph, join conds).

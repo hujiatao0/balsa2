@@ -6,6 +6,7 @@ from balsa.util import plans_lib
 import numpy as np
 import torch
 from absl import logging
+from balsa import experience
 
 
 class SimPlanFeaturizer(plans_lib.Featurizer):
@@ -79,6 +80,10 @@ class SimQueryFeaturizer(plans_lib.Featurizer):
                                                               total_rows)
             vec[idx] = est_rows / total_rows
         return vec
+    
+    @property
+    def dims(self):
+        return len(self.workload_info.rel_ids)
     
 
 class SimQueryFeaturizerV2(SimQueryFeaturizer):
@@ -308,4 +313,53 @@ class Sim(object):
         p.Define('loss_type', None, 'Options: None (MSE), mean_qerror.')
         return p
     
+    def __init__(self, params):
+        self.params = params.Copy()
+        p = self.params
+        # Plumb through same flags.
+        p.search.plan_physical_ops = p.plan_physical
+        p.search.cost_model.cost_physical_ops = p.plan_physical
+        logging.info(p)
+
+        # Instantiate search.
+        self.search = p.search.cls(p.search)
+
+        # Instantiate workload.
+        self.workload = p.workload.cls(p.workload)
+        wi = self.workload.workload_info
+        generic_join = np.array(['Join'])
+        generic_scan = np.array(['Scan'])
+        if not p.plan_physical:
+            # These are used in optimizer.py (for planning).
+            wi.join_types = generic_join
+            wi.scan_types = generic_scan
+        else:
+            self.search.SetPhysicalOps(join_ops=wi.join_types,
+                                       scan_ops=wi.scan_types)
+        if self.IsPlanPhysicalButUseGenericOps():
+            self.search.SetPhysicalOps(join_ops=generic_join,
+                                       scan_ops=generic_scan)
+
+        # A list of SubplanGoalCost.
+        self.simulation_data = []
+
+        self.planner = None
+        self.query_featurizer = None
+
+        self.all_nodes = self.workload.Queries(split='all')
+        self.train_nodes = self.workload.Queries(split='train')
+        self.test_nodes = self.workload.Queries(split='test')
+        logging.info('{} train queries: {}'.format(
+            len(self.train_nodes),
+            [node.info['query_name'] for node in self.train_nodes]))
+        logging.info('{} test queries: {}'.format(
+            len(self.test_nodes),
+            [node.info['query_name'] for node in self.test_nodes]))
+
+        plans_lib.RewriteAsGenericJoinsScans(self.all_nodes)
+
+        # This call ensures that node.info['all_filters_est_rows'] is written,
+        # which is used by the query featurizer.
+        experience.SimpleReplayBuffer(self.all_nodes)
+
     
