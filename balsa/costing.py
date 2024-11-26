@@ -39,6 +39,34 @@ class NullCost(CostModel):
         return 0
     
 
+class PostgresCost(CostModel):
+    """The Postgres cost model."""
+
+    def __call__(self, node, join_conds):
+        # NOTE: Postgres could fail a HashJoin hint with "SELECT * ..." but
+        # accept the hint with "SELECT min(...) ...".
+        #
+        # For cost model learning (sim), when collecting data there is indeed a
+        # difference between:
+        #
+        #    <query features> <subplan> <cost of the query: SELECT * ...>
+        #  vs.
+        #    <query features> <subplan> <cost of the query: SELECT <exprs> ...>
+        #
+        # In practice it should not affect the estimated costs too much.
+        sql_str = node.to_sql(join_conds, with_select_exprs=True)
+        return self.ScoreWithSql(node, sql_str)
+
+    def ScoreWithSql(self, node, sql):
+        p = self.params
+        cost = postgres.GetCostFromPg(
+            sql=sql,
+            hint=node.hint_str(with_physical_hints=p.cost_physical_ops),
+            check_hint_used=True,
+        )
+        return cost
+    
+
 class MinCardCost(CostModel):
     """A minimizing-cardinality cost model.
 

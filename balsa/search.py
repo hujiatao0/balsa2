@@ -38,4 +38,11 @@ class DynamicProgramming(object):
         self.join_ops = ['Join']
         self.scan_ops = ['Scan']
         self.use_plan_restrictions = (p.search_space != 'bushy_norestrict')
+
+    def SetPhysicalOps(self, join_ops, scan_ops):
+        """Must be called once if p.plan_physical_ops is true."""
+        p = self.params
+        assert p.plan_physical_ops
+        self.join_ops = copy.deepcopy(join_ops)
+        self.scan_ops = copy.deepcopy(scan_ops)
         

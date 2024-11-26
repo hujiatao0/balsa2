@@ -5,9 +5,98 @@ from balsa import search
 from balsa.util import plans_lib
 import numpy as np
 import torch
+import pickle
+import pytorch_lightning as pl
 from absl import logging
 from balsa import experience
+from balsa import costing
+import train_utils
+from balsa import models
+import torch.nn.functional as F
+from balsa.util import postgres
+import time
+import hashlib
 
+
+class SimModel(pl.LightningModule):
+    
+    def __init__(self,
+                 use_tree_conv,
+                 query_feat_dims,
+                 plan_feat_dims,
+                 mlp_hiddens,
+                 tree_conv_version=None,
+                 loss_type=None,
+                 torch_invert_cost=None,
+                 query_featurizer=None,
+                 perturb_query_features=False):
+        super().__init__()
+        assert loss_type in [None, 'mean_qerror'], loss_type
+        self.save_hyperparameters()
+        self.use_tree_conv = use_tree_conv
+        if use_tree_conv:
+            self.tree_conv = models.treeconv.TreeConvolution(
+                feature_size=query_feat_dims,
+                plan_size=plan_feat_dims,
+                label_size=1,
+                version=tree_conv_version)
+        else:
+            self.mlp = balsa.models.MakeMlp(input_size=query_feat_dims +
+                                            plan_feat_dims,
+                                            num_outputs=1,
+                                            hiddens=mlp_hiddens,
+                                            activation='relu')
+        self.loss_type = loss_type
+        self.torch_invert_cost = torch_invert_cost
+        self.query_featurizer = query_featurizer
+        self.perturb_query_features = perturb_query_features
+
+    def forward(self, query_feat, plan_feat, indexes=None):
+        if self.use_tree_conv:
+            return self.tree_conv(query_feat, plan_feat, indexes)
+        return self.mlp(torch.cat([query_feat, plan_feat], -1))
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.parameters(), lr=3e-3)
+        return optimizer
+
+    def training_step(self, batch, batch_idx):
+        loss = self._ComputeLoss(batch)
+        result = pl.TrainResult(minimize=loss)
+        result.log('train_loss', loss, prog_bar=True)
+        return result
+
+    def validation_step(self, batch, batch_idx):
+        val_loss = self._ComputeLoss(batch)
+        result = pl.EvalResult(checkpoint_on=val_loss, early_stop_on=val_loss)
+        result.log('val_loss', val_loss, prog_bar=True)
+        return result
+
+    def _ComputeLoss(self, batch):
+        query_feat, plan_feat, *rest = batch
+        target = rest[-1]
+        if self.training and self.perturb_query_features is not None:
+            # No-op for non-enabled featurizers.
+            query_feat = self.query_featurizer.PerturbQueryFeatures(
+                query_feat, distribution=self.perturb_query_features)
+        if self.use_tree_conv:
+            assert len(rest) == 2
+            output = self.forward(query_feat, plan_feat, rest[0])
+        else:
+            assert len(rest) == 1
+            output = self.forward(query_feat, plan_feat)
+        if self.loss_type == 'mean_qerror':
+            output_inverted = self.torch_invert_cost(output.reshape(-1,))
+            target_inverted = self.torch_invert_cost(target.reshape(-1,))
+            return train_utils.QErrorLoss(output_inverted, target_inverted)
+        return F.mse_loss(output.reshape(-1,), target.reshape(-1,))
+
+    def on_after_backward(self):
+        if self.global_step % 50 == 0:
+            norm_dict = self.grad_norm(norm_type=2)
+            total_norm = norm_dict['grad_2.0_norm_total']
+            self.logger.log_metrics({'total_grad_norm': total_norm},
+                                    step=self.global_step)
 
 class SimPlanFeaturizer(plans_lib.Featurizer):
     """Implements the plan featurizer.
@@ -313,6 +402,34 @@ class Sim(object):
         p.Define('loss_type', None, 'Options: None (MSE), mean_qerror.')
         return p
     
+    @classmethod
+    def HashOfSimData(cls, p):
+        """Gets the hash that should determine the simulation data."""
+        # Use (a few attributes inside Params, Postgres configs) as hash key.
+        # Using PG configs is necessary because things like PG version / PG
+        # optimizer settings affect collected costs.
+        # NOTE: in theory, other stateful effects such as whether ANALYZE has
+        # been called on a PG database also affects the collected costs.
+        _RELEVANT_HPARAMS = [
+            'search',
+            'workload',
+            'skip_data_collection_geq_num_rels',
+            'generic_ops_only_for_min_card_cost',
+            'plan_physical',
+        ]
+        param_vals = [p.Get(hparam) for hparam in _RELEVANT_HPARAMS]
+        param_vals = [
+            v.ToText() if isinstance(v, hyperparams.Params) else str(v)
+            for v in param_vals
+        ]
+        spec = '\n'.join(param_vals)
+        if p.search.cost_model.cls is costing.PostgresCost:
+            # Only PostgresCost would depend on PG configs.
+            pg_configs = map(str, postgres.GetServerConfigs())
+            spec += '\n'.join(pg_configs)
+        hash_sim = hashlib.sha1(spec.encode()).hexdigest()[:8]
+        return hash_sim
+    
     def __init__(self, params):
         self.params = params.Copy()
         p = self.params
@@ -361,5 +478,122 @@ class Sim(object):
         # This call ensures that node.info['all_filters_est_rows'] is written,
         # which is used by the query featurizer.
         experience.SimpleReplayBuffer(self.all_nodes)
+
+    def IsPlanPhysicalButUseGenericOps(self):
+        p = self.params
+        # This is a logical-only cost model.  Let's only enumerate generic ops.
+        return (p.plan_physical and p.generic_ops_only_for_min_card_cost and
+                isinstance(self.search.cost_model, costing.MinCardCost))
+    
+    def _SimulationDataPath(self):
+        p = self.params
+        hash_key = Sim.HashOfSimData(p)
+        return 'data/sim-data-{}.pkl'.format(hash_key)
+
+    def _LoadSimulationData(self):
+        path = self._SimulationDataPath()
+        try:
+            with open(path, 'rb') as f:
+                self.simulation_data = pickle.load(f)
+        except Exception as e:
+            return False
+        logging.info('Loaded simulation data (len {}) from: {}'.format(
+            len(self.simulation_data), path))
+        logging.info('Training data (first 50, total {}):'.format(
+            len(self.simulation_data)))
+        logging.info('\n'.join(map(str, self.simulation_data[:50])))
+        return True
+    
+    def CollectSimulationData(self, try_load=True):
+        p = self.params
+        if try_load:
+            done = self._LoadSimulationData()
+            if done:
+                return
+
+        start = time.time()
+        num_collected = 0
+        for query_node in self.train_nodes:
+            # TODO: can parallelize this loop.  Take care of the hooks.
+            num_rels = len(query_node.leaf_ids())
+            logging.info('query={} num_rels={}\n{}'.format(
+                query_node.info['query_name'], num_rels,
+                query_node.info['sql_str']))
+            if p.skip_data_collection_geq_num_rels is not None:
+                if num_rels >= p.skip_data_collection_geq_num_rels:
+                    continue
+            num_collected += 1
+
+            # Accumulate data points from this query.
+            accum = []
+            info_to_attach = {
+                'overall_join_graph': query_node.info['parsed_join_graph'],
+                'overall_join_conds': query_node.info['parsed_join_conds'],
+                'path': query_node.info['path'],
+            }
+            self.search.PushOnEnumeratedHook(
+                self._MakeOnEnumeratedHook(accum, info_to_attach, num_rels))
+
+            # Enumerate plans.
+            self.search.Run(query_node, query_node.info['sql_str'])
+
+            self.search.PopOnEnumeratedHook()
+
+            # Dedup accumulated data points.
+            accum = self._DedupDataPoints(accum)
+
+            self.simulation_data.extend(accum)
+
+        simulation_time = time.time() - start
+
+        logging.info('Collection done, stats:')
+        logging.info('  num_queries={} num_collected_queries={} num_points={}'\
+                     ' latency_s={:.1f}'.format(
+            len(self.train_nodes), num_collected, len(self.simulation_data),
+            simulation_time))
+
+        if try_load:
+            self._SaveSimulationData()
+
+        return simulation_time, len(self.simulation_data)
+    
+    def Train(self, train_data=None, load_from_checkpoint=None, loggers=None):
+        p = self.params
+        # Pre-process and featurize data.
+        data = train_data
+        if data is None:
+            data = self._FeaturizeTrainingData()
+
+        # Make the DataLoader.
+        logging.info('_MakeDatasetAndLoader()')
+        self.train_dataset, self.train_loader, _, self.val_loader = \
+            self._MakeDatasetAndLoader(data)
+        batch = next(iter(self.train_loader))
+        logging.info(
+            'Example batch (query,plan,indexes,cost):\n{}'.format(batch))
+
+        # Initialize model.
+        _, query_feat_dims = batch[0].shape
+        if issubclass(p.plan_featurizer_cls, plans_lib.TreeNodeFeaturizer):
+            # make_and_featurize_trees() tranposes the latter 2 dims.
+            unused_bs, plan_feat_dims, unused_max_tree_nodes = batch[1].shape
+            logging.info(
+                'unused_bs, plan_feat_dims, unused_max_tree_nodes {}'.format(
+                    (unused_bs, plan_feat_dims, unused_max_tree_nodes)))
+        else:
+            unused_bs, plan_feat_dims = batch[1].shape
+        self.model = self._MakeModel(query_feat_dims=query_feat_dims,
+                                     plan_feat_dims=plan_feat_dims)
+        balsa.models.ReportModel(self.model)
+
+        # Train or load.
+        self.trainer = self._MakeTrainer(loggers=loggers)
+        if load_from_checkpoint:
+            self.model = SimModel.load_from_checkpoint(load_from_checkpoint)
+            logging.info(
+                'Loaded pretrained checkpoint: {}'.format(load_from_checkpoint))
+        else:
+            self.trainer.fit(self.model, self.train_loader, self.val_loader)
+        return data
 
     

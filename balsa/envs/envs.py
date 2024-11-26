@@ -87,6 +87,33 @@ class Workload(object):
         elif split == 'test':
             return self.test_nodes
         
+    def FilterQueries(self, query_dir, query_glob, test_query_glob):
+        all_sql_set_new = self._get_sql_set(query_dir, query_glob)
+        test_sql_set_new = self._get_sql_set(query_dir, test_query_glob)
+        assert test_sql_set_new.issubset(all_sql_set_new), (test_sql_set_new,
+                                                            all_sql_set_new)
+
+        all_sql_set = set([n.info['path'] for n in self.query_nodes])
+        assert all_sql_set_new.issubset(all_sql_set), (
+            'Missing nodes in init_experience; '
+            'To fix: remove data/initial_policy_data.pkl, or see README.')
+
+        query_nodes_new = [
+            n for n in self.query_nodes if n.info['path'] in all_sql_set_new
+        ]
+        train_nodes_new = [
+            n for n in query_nodes_new
+            if test_query_glob is None or n.info['path'] not in test_sql_set_new
+        ]
+        test_nodes_new = [
+            n for n in query_nodes_new if n.info['path'] in test_sql_set_new
+        ]
+        assert len(train_nodes_new) > 0
+
+        self.query_nodes = query_nodes_new
+        self.train_nodes = train_nodes_new
+        self.test_nodes = test_nodes_new
+        
     def UseDialectSql(self, p):
         dialect_sql_dir = p.engine_dialect_query_dir
         for node in self.query_nodes:

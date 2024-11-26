@@ -8,6 +8,21 @@ import glob
 import gc
 import collections
 
+from balsa.models import treeconv
+
+
+def TreeConvFeaturize(plan_featurizer, subplans):
+    """Returns (featurized plans, tree conv indexes) tensors."""
+    assert len(subplans) > 0
+    # This class currently requires batch-featurizing, due to internal
+    # padding.  This is different from our other per-node Featurizers.
+    print('Calling make_and_featurize_trees()...')
+    t1 = time.time()
+    trees, indexes = treeconv.make_and_featurize_trees(subplans,
+                                                       plan_featurizer)
+    print('took {:.1f}s'.format(time.time() - t1))
+    return trees, indexes
+
 class Experience(object):
 
     def __init__(
@@ -126,3 +141,59 @@ class Experience(object):
             len(self.nodes) - initial_nodes_len, len(paths), path_glob,
             '\n'.join(paths)))
         print('Total unique plans (num_query_execs):', total_num_unique_plans)
+
+
+class SimpleReplayBuffer(Experience):
+    """A simple replay buffer.
+
+    It featurizes each element in 'self.nodes' independently, without
+    performing subtree extraction, deduplication, take-the-minimum-cost, or
+    assuming relationships among query nodes.
+
+    Usage:
+
+       nodes = [ <list of subplans from a single query, dedup'd> ]
+       buffer = SimpleReplayBuffer(nodes)
+
+       nodes = [ <N dedup'd subplans from Q1>; <M from Q2> ]
+       buffer = SimpleReplayBuffer(nodes)
+
+       # Simply featurizes each element independently.
+       data = buffer.featurize()
+    """
+
+    def featurize(self, rewrite_generic=False, verbose=False):
+        self.featurize_with_subplans(self.nodes, rewrite_generic, verbose)
+
+    def featurize_with_subplans(self,
+                                subplans,
+                                rewrite_generic=False,
+                                verbose=False):
+        t1 = time.time()
+        assert len(subplans) == len(self.nodes), (len(subplans),
+                                                  len(self.nodes))
+        self.prepare(rewrite_generic, verbose)
+        all_query_vecs = [None] * len(self.nodes)
+        all_feat_vecs = [None] * len(self.nodes)
+        all_pa_pos_vecs = [None] * len(self.nodes)
+        all_costs = [None] * len(self.nodes)
+        for i, node in enumerate(self.nodes):
+            all_query_vecs[i] = self.query_featurizer(node)
+            all_costs[i] = node.cost
+
+        print('Spent {:.1f}s'.format(time.time() - t1))
+        if isinstance(self.featurizer, plans_lib.TreeNodeFeaturizer):
+            all_feat_vecs, all_pa_pos_vecs = TreeConvFeaturize(
+                self.featurizer, subplans)
+        else:
+            for i, node in enumerate(self.nodes):
+                all_feat_vecs[i] = self.featurizer(subplans[i])
+
+        # Debug print: check if query vectors are different/same.
+        for i in range(min(len(self.nodes), 10)):
+            print('query={} plan={} cost={}'.format(
+                (all_query_vecs[i] *
+                 np.arange(1, 1 + len(all_query_vecs[i]))).sum(),
+                all_feat_vecs[i], all_costs[i]))
+
+        return all_query_vecs, all_feat_vecs, all_pa_pos_vecs, all_costs

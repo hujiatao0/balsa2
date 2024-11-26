@@ -196,6 +196,33 @@ class _Param:
     return self._value
   
 
+def CopyFieldsTo(from_p, to_p, skip=None):
+  """Copy fields from one Params to another, with optional skipped params.
+
+  Preserves `type(to_p.Instantiate())`. Use `from_p.Copy()` instead if requiring
+  a deep copy of `from_p`, without updating `to_p`.
+
+  Args:
+    from_p: Source params to copy from.
+    to_p: Destination params to copy to.
+    skip: If not None, a list of strings of param names to skip. Automatically
+      skips InstantiableParams' 'cls' parameter.
+
+  Returns:
+    The updated to_p.
+  """
+  skip = skip or []
+  skip.append('cls')
+  for n, p in from_p.IterParams():
+    if n in skip:
+      continue
+    if isinstance(p, Params):
+      to_p.Set(**{n: p.Copy()})
+    else:
+      to_p.Set(**{n: p})
+  return to_p
+  
+
 class Params:
   """Stores data for a set of parameters.
 

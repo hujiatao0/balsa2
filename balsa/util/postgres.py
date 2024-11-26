@@ -5,6 +5,12 @@ import pprint
 import subprocess
 
 
+def GetServerConfigs():
+    """Returns all live configs as [(param, value, help)]."""
+    with pg_executor.Cursor() as cursor:
+        cursor.execute('show all;')
+        return cursor.fetchall()
+
 
 def DropBufferCache():
     # WARNING: no effect if PG is running on another machine
@@ -64,6 +70,11 @@ def SqlToPlanNode(sql,
     if not keep_scans_joins_only:
         return node, json_dict
     return plans_lib.FilterScansOrJoins(node), json_dict
+
+
+def GetCardinalityEstimateFromPg(sql, verbose=False):
+    _, json_dict = SqlToPlanNode(sql, verbose=verbose)
+    return json_dict['Plan']['Plan Rows']
 
 
 def _run_explain(explain_str,
@@ -209,3 +220,52 @@ def EstimateFilterRows(nodes):
         for table_id, pred in node.info['all_filters'].items():
             d[table_id] = cache[(table_id, pred)]
         node.info['all_filters_est_rows'] = d
+
+
+def GetAllTableNumRows(rel_names):
+    """Ask PG how many number of rows each rel in rel_names has.
+
+    Returns:
+      A dict, {rel name: # rows}.
+    """
+
+    CACHE = {
+        'aka_name': 901343,
+        'aka_title': 361472,
+        'cast_info': 36244344,
+        'char_name': 3140339,
+        'comp_cast_type': 4,
+        'company_name': 234997,
+        'company_type': 4,
+        'complete_cast': 135086,
+        'info_type': 113,
+        'keyword': 134170,
+        'kind_type': 7,
+        'link_type': 18,
+        'movie_companies': 2609129,
+        'movie_info': 14835720,
+        'movie_info_idx': 1380035,
+        'movie_keyword': 4523930,
+        'movie_link': 29997,
+        'name': 4167491,
+        'person_info': 2963664,
+        'role_type': 12,
+        'title': 2528312,
+    }
+
+    d = {}
+    with pg_executor.Cursor() as cursor:
+        for rel_name in rel_names:
+            if rel_name in CACHE:
+                # Kind of slow to ask PG for this.  For some reason it doesn't
+                # immediately return from catalog but instead seems to do scans.
+                d[rel_name] = CACHE[rel_name]
+                continue
+
+            sql = 'SELECT count(*) FROM {};'.format(rel_name)
+            print('Issue:', sql)
+            cursor.execute(sql)
+            num_rows = cursor.fetchall()[0][0]
+            print(num_rows)
+            d[rel_name] = num_rows
+    return d
